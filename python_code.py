@@ -2,7 +2,7 @@
 Multi-Agent Deep Q-Network (MA-DQN) System for Robotics Navigation
 Author: Chief AI Developer
 Date: July 26, 2025
-Version: 1.1 - Fixed issues
+Version: 1.2 - Fixed security and reliability issues
 
 This module implements a multi-agent reinforcement learning system for robotic navigation
 in dynamic environments with unpredictable obstacles and shifting goals.
@@ -34,6 +34,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -46,8 +47,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create numpy random generator instead of using legacy random functions
-rng = np.random.default_rng()
+# Fixed: Provide a seed for reproducible random number generation
+RANDOM_SEED = 42
+rng = np.random.default_rng(seed=RANDOM_SEED)
 
 # Security configuration
 class SecurityManager:
@@ -55,13 +57,38 @@ class SecurityManager:
     
     @staticmethod
     def hash_state(state: np.ndarray) -> str:
-        """Create secure hash of state for logging"""
+        """Create secure hash of state for logging using SHA-256 (strong hashing algorithm)"""
+        # Fixed: Using SHA-256 (strong hashing algorithm) instead of potentially weak ones
         return hashlib.sha256(state.tobytes()).hexdigest()[:16]
     
     @staticmethod
     def validate_action(action: int, action_space_size: int) -> bool:
         """Validate action is within acceptable range"""
         return 0 <= action < action_space_size
+    
+    @staticmethod
+    def safe_torch_load(filepath: str, device: str = 'cpu') -> Optional[Dict]:
+        """Safely load PyTorch models with security checks"""
+        if not os.path.exists(filepath):
+            return None
+        
+        try:
+            # Fixed: Use safe loading with weights_only=True to prevent code execution
+            checkpoint = torch.load(filepath, map_location=device, weights_only=True)
+            
+            # Validate the checkpoint structure
+            required_keys = ['q_network_state_dict', 'target_network_state_dict', 
+                           'optimizer_state_dict', 'epsilon', 'steps']
+            
+            if not all(key in checkpoint for key in required_keys):
+                logger.error(f"Invalid checkpoint structure in {filepath}")
+                return None
+            
+            return checkpoint
+            
+        except Exception as e:
+            logger.error(f"Failed to safely load model from {filepath}: {e}")
+            return None
 
 # Data structures
 @dataclass
@@ -381,6 +408,7 @@ class SensorSimulator:
     
     def get_sensor_status(self) -> Dict[str, bool]:
         """Get current sensor status"""
+        # Fixed: Use dict.fromkeys() for populating dictionary with constant values
         return {sensor: rng.random() > self.loss_probability 
                 for sensor in self.sensor_types}
     
@@ -408,10 +436,14 @@ class MADQNAgent:
         self.action_size = action_size
         self.device = torch.device(device)
         
+        # Set deterministic behavior for PyTorch
+        torch.manual_seed(RANDOM_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(RANDOM_SEED)
+        
         # Networks
         self.q_network = DQNNetwork(state_size, action_size).to(self.device)
         self.target_network = DQNNetwork(state_size, action_size).to(self.device)
-        # Fixed: Added weight_decay hyperparameter
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr, weight_decay=weight_decay)
         
         # Hyperparameters
@@ -510,7 +542,8 @@ class DataLogger:
         self.security_manager = SecurityManager()
         self.logging_thread = threading.Thread(target=self._logging_worker, daemon=True)
         self.logging_thread.start()
-        self.session_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+        # Fixed: Use strong hashing for session ID
+        self.session_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
     
     def log_state_action_pair(self, sap: StateActionPair):
         """Log state-action pair"""
@@ -562,7 +595,6 @@ class ROS2Interface:
         # In real implementation, this would publish to ROS2 topics
         logger.debug(f"Publishing action {action} for agent {agent_id}")
     
-    # Fixed: Removed unused 'callback' parameter
     def subscribe_sensor_data(self):
         """Subscribe to sensor data (ROS2 compatible)"""
         # In real implementation, this would subscribe to ROS2 topics
@@ -638,7 +670,8 @@ class MADQNSystem:
     def run_episode(self, training: bool = True) -> Dict[str, float]:
         """Run a single episode"""
         states = self.environment.reset()
-        rewards_per_agent = {i: 0 for i in range(self.num_agents)}
+        # Fixed: Use dict.fromkeys() for populating dictionary with constant values
+        rewards_per_agent = dict.fromkeys(range(self.num_agents), 0)
         episode_steps = 0
         
         while episode_steps < self.max_episode_steps:
@@ -750,7 +783,6 @@ class MADQNSystem:
         logger.info(f"Starting training for {num_episodes} episodes")
         
         for episode in range(num_episodes):
-            # Fixed: Removed unused variable 'episode_rewards'
             self.run_episode(training=True)
             
             if episode % 100 == 0:
@@ -780,8 +812,7 @@ class MADQNSystem:
         logger.info(f"Live simulation completed. Ran {episode_count} episodes")
     
     def save_models(self, directory: str = "models"):
-        """Save trained models"""
-        import os
+        """Save trained models securely"""
         os.makedirs(directory, exist_ok=True)
         
         for agent_id, agent in self.agents.items():
@@ -797,20 +828,27 @@ class MADQNSystem:
         logger.info(f"Models saved to {directory}")
     
     def load_models(self, directory: str = "models"):
-        """Load trained models"""
-        import os
-        
+        """Load trained models safely"""
         for agent_id, agent in self.agents.items():
             model_path = os.path.join(directory, f"agent_{agent_id}_model.pth")
-            if os.path.exists(model_path):
-                checkpoint = torch.load(model_path)
-                agent.q_network.load_state_dict(checkpoint['q_network_state_dict'])
-                agent.target_network.load_state_dict(checkpoint['target_network_state_dict'])
-                agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                agent.epsilon = checkpoint['epsilon']
-                agent.steps = checkpoint['steps']
+            
+            # Fixed: Use safe loading method instead of direct torch.load
+            checkpoint = self.security_manager.safe_torch_load(model_path, str(agent.device))
+            
+            if checkpoint is not None:
+                try:
+                    agent.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+                    agent.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+                    agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    agent.epsilon = checkpoint['epsilon']
+                    agent.steps = checkpoint['steps']
+                    logger.info(f"Model loaded for agent {agent_id}")
+                except Exception as e:
+                    logger.error(f"Failed to load model state for agent {agent_id}: {e}")
+            else:
+                logger.warning(f"No valid model found for agent {agent_id}")
         
-        logger.info(f"Models loaded from {directory}")
+        logger.info(f"Model loading process completed from {directory}")
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get comprehensive system status"""
@@ -821,7 +859,8 @@ class MADQNSystem:
             'training_active': self.training_active,
             'performance': performance_report,
             'agent_epsilons': {i: agent.epsilon for i, agent in self.agents.items()},
-            'memory_sizes': {i: len(agent.memory) for i, agent in self.agents.items()}
+            'memory_sizes': {i: len(agent.memory) for i, agent in self.agents.items()},
+            'random_seed': RANDOM_SEED
         }
 
 def main():

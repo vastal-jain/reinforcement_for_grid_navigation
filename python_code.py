@@ -2,7 +2,7 @@
 Multi-Agent Deep Q-Network (MA-DQN) System for Robotics Navigation
 Author: Chief AI Developer
 Date: July 26, 2025
-Version: 1.0
+Version: 1.1 - Fixed issues
 
 This module implements a multi-agent reinforcement learning system for robotic navigation
 in dynamic environments with unpredictable obstacles and shifting goals.
@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import random
 import threading
 import time
 import logging
@@ -46,6 +45,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Create numpy random generator instead of using legacy random functions
+rng = np.random.default_rng()
 
 # Security configuration
 class SecurityManager:
@@ -136,7 +138,7 @@ class ReplayBuffer:
         probabilities = priorities ** self.alpha
         probabilities /= probabilities.sum()
         
-        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
+        indices = rng.choice(len(self.buffer), batch_size, p=probabilities)
         experiences = [self.buffer[idx] for idx in indices]
         
         # Importance sampling weights
@@ -177,54 +179,68 @@ class GridEnvironment:
         self.obstacles.clear()
         self.dynamic_obstacles.clear()
         
-        # Place agents randomly
-        positions = random.sample([(i, j) for i in range(self.grid_size) 
-                                 for j in range(self.grid_size)], self.num_agents * 2)
-        
-        for i in range(self.num_agents):
-            self.agent_positions[i] = positions[i]
-            self.goals[i] = positions[i + self.num_agents]
+        # Place agents randomly using numpy random generator
+        self._place_agents_randomly()
         
         # Add initial obstacles
         self._generate_obstacles()
         
         return {i: self._get_state(i) for i in range(self.num_agents)}
     
+    def _place_agents_randomly(self):
+        """Place agents and goals randomly on the grid"""
+        all_positions = [(i, j) for i in range(self.grid_size) for j in range(self.grid_size)]
+        selected_indices = rng.choice(len(all_positions), size=self.num_agents * 2, replace=False)
+        selected_positions = [all_positions[idx] for idx in selected_indices]
+        
+        for i in range(self.num_agents):
+            self.agent_positions[i] = selected_positions[i]
+            self.goals[i] = selected_positions[i + self.num_agents]
+    
     def _generate_obstacles(self):
         """Generate random obstacles"""
-        num_obstacles = random.randint(50, 100)
+        num_obstacles = rng.integers(50, 101)
         occupied_positions = set(self.agent_positions.values()) | set(self.goals.values())
         
         for _ in range(num_obstacles):
-            pos = (random.randint(0, self.grid_size-1), random.randint(0, self.grid_size-1))
+            pos = (rng.integers(0, self.grid_size), rng.integers(0, self.grid_size))
             if pos not in occupied_positions:
                 self.obstacles.add(pos)
-                if random.random() < 0.3:  # 30% chance of being dynamic
+                if rng.random() < 0.3:  # 30% chance of being dynamic
                     self.dynamic_obstacles.add(pos)
     
     def _update_dynamic_obstacles(self):
         """Update positions of dynamic obstacles"""
         current_time = time.time()
-        if current_time - self.last_obstacle_update > self.obstacle_update_interval:
-            new_dynamic = set()
-            for obs in self.dynamic_obstacles:
-                # Move obstacle randomly
-                moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
-                dx, dy = random.choice(moves)
-                new_pos = (max(0, min(self.grid_size-1, obs[0] + dx)),
-                          max(0, min(self.grid_size-1, obs[1] + dy)))
-                
-                # Check if new position is valid
-                if (new_pos not in self.agent_positions.values() and 
-                    new_pos not in self.goals.values()):
-                    new_dynamic.add(new_pos)
-                    self.obstacles.discard(obs)
-                    self.obstacles.add(new_pos)
-                else:
-                    new_dynamic.add(obs)
+        if current_time - self.last_obstacle_update <= self.obstacle_update_interval:
+            return
             
-            self.dynamic_obstacles = new_dynamic
-            self.last_obstacle_update = current_time
+        new_dynamic = set()
+        moves = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
+        
+        for obs in self.dynamic_obstacles:
+            dx, dy = moves[rng.integers(0, len(moves))]
+            new_pos = self._calculate_new_position(obs, dx, dy)
+            
+            if self._is_valid_obstacle_position(new_pos):
+                new_dynamic.add(new_pos)
+                self.obstacles.discard(obs)
+                self.obstacles.add(new_pos)
+            else:
+                new_dynamic.add(obs)
+        
+        self.dynamic_obstacles = new_dynamic
+        self.last_obstacle_update = current_time
+    
+    def _calculate_new_position(self, pos: Tuple[int, int], dx: int, dy: int) -> Tuple[int, int]:
+        """Calculate new position with bounds checking"""
+        return (max(0, min(self.grid_size-1, pos[0] + dx)),
+                max(0, min(self.grid_size-1, pos[1] + dy)))
+    
+    def _is_valid_obstacle_position(self, pos: Tuple[int, int]) -> bool:
+        """Check if position is valid for obstacle placement"""
+        return (pos not in self.agent_positions.values() and 
+                pos not in self.goals.values())
     
     def _get_state(self, agent_id: int) -> np.ndarray:
         """Get state representation for agent"""
@@ -232,6 +248,15 @@ class GridEnvironment:
         goal = self.goals[agent_id]
         
         # Local view (7x7 around agent)
+        local_view = self._get_local_view(agent_id, pos, goal)
+        
+        # Add global information
+        global_info = self._get_global_info(pos, goal)
+        
+        return np.concatenate([local_view.flatten(), global_info])
+    
+    def _get_local_view(self, agent_id: int, pos: Tuple[int, int], goal: Tuple[int, int]) -> np.ndarray:
+        """Get local view around agent"""
         view_size = 7
         half_view = view_size // 2
         local_view = np.zeros((view_size, view_size, 4))  # 4 channels
@@ -242,93 +267,110 @@ class GridEnvironment:
                 world_j = pos[1] - half_view + j
                 
                 if 0 <= world_i < self.grid_size and 0 <= world_j < self.grid_size:
-                    # Channel 0: obstacles
-                    if (world_i, world_j) in self.obstacles:
-                        local_view[i, j, 0] = 1
-                    
-                    # Channel 1: other agents
-                    for other_id, other_pos in self.agent_positions.items():
-                        if other_id != agent_id and other_pos == (world_i, world_j):
-                            local_view[i, j, 1] = 1
-                    
-                    # Channel 2: goals
-                    if (world_i, world_j) == goal:
-                        local_view[i, j, 2] = 1
-                    
-                    # Channel 3: agent itself
-                    if (world_i, world_j) == pos:
-                        local_view[i, j, 3] = 1
+                    self._populate_view_cell(local_view, i, j, world_i, world_j, 
+                                           agent_id, pos, goal)
         
-        # Add global information
-        global_info = np.array([
+        return local_view
+    
+    def _populate_view_cell(self, local_view: np.ndarray, i: int, j: int, 
+                           world_i: int, world_j: int, agent_id: int,
+                           pos: Tuple[int, int], goal: Tuple[int, int]):
+        """Populate a single cell in the local view"""
+        # Channel 0: obstacles
+        if (world_i, world_j) in self.obstacles:
+            local_view[i, j, 0] = 1
+        
+        # Channel 1: other agents
+        for other_id, other_pos in self.agent_positions.items():
+            if other_id != agent_id and other_pos == (world_i, world_j):
+                local_view[i, j, 1] = 1
+        
+        # Channel 2: goals
+        if (world_i, world_j) == goal:
+            local_view[i, j, 2] = 1
+        
+        # Channel 3: agent itself
+        if (world_i, world_j) == pos:
+            local_view[i, j, 3] = 1
+    
+    def _get_global_info(self, pos: Tuple[int, int], goal: Tuple[int, int]) -> np.ndarray:
+        """Get global information for the agent"""
+        return np.array([
             pos[0] / self.grid_size,
             pos[1] / self.grid_size,
             goal[0] / self.grid_size,
             goal[1] / self.grid_size,
             len(self.obstacles) / (self.grid_size * self.grid_size)
         ])
-        
-        return np.concatenate([local_view.flatten(), global_info])
     
     def step(self, actions: Dict[int, int]) -> Tuple[Dict[int, np.ndarray], Dict[int, float], Dict[int, bool], Dict]:
         """Execute actions for all agents"""
         self._update_dynamic_obstacles()
         
         moves = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)]  # stay, right, left, down, up
-        rewards = {}
-        dones = {}
-        new_positions = {}
+        new_positions, rewards, dones = self._calculate_step_results(actions, moves)
         
-        # Calculate new positions
-        for agent_id, action in actions.items():
-            if agent_id in self.agent_positions:
-                pos = self.agent_positions[agent_id]
-                dx, dy = moves[action]
-                new_pos = (max(0, min(self.grid_size-1, pos[0] + dx)),
-                          max(0, min(self.grid_size-1, pos[1] + dy)))
-                new_positions[agent_id] = new_pos
-        
-        # Check for collisions and update positions
+        # Update positions
         for agent_id, new_pos in new_positions.items():
-            old_pos = self.agent_positions[agent_id]
-            goal = self.goals[agent_id]
-            
-            # Check for obstacles
-            if new_pos in self.obstacles:
-                rewards[agent_id] = -10  # Collision penalty
-                new_pos = old_pos  # Stay in place
-            else:
-                # Check for agent collisions
-                collision = False
-                for other_id, other_new_pos in new_positions.items():
-                    if other_id != agent_id and other_new_pos == new_pos:
-                        collision = True
-                        break
-                
-                if collision:
-                    rewards[agent_id] = -5  # Agent collision penalty
-                    new_pos = old_pos
-                else:
-                    # Calculate reward
-                    old_dist = np.linalg.norm(np.array(old_pos) - np.array(goal))
-                    new_dist = np.linalg.norm(np.array(new_pos) - np.array(goal))
-                    
-                    if new_pos == goal:
-                        rewards[agent_id] = 100  # Goal reached
-                        dones[agent_id] = True
-                        # Shift goal
-                        self.goals[agent_id] = (random.randint(0, self.grid_size-1),
-                                              random.randint(0, self.grid_size-1))
-                    else:
-                        rewards[agent_id] = (old_dist - new_dist) * 10  # Progress reward
-                        dones[agent_id] = False
-            
             self.agent_positions[agent_id] = new_pos
         
         # Get new states
         next_states = {i: self._get_state(i) for i in range(self.num_agents)}
         
         return next_states, rewards, dones, {}
+    
+    def _calculate_step_results(self, actions: Dict[int, int], moves: List[Tuple[int, int]]) -> Tuple[Dict, Dict, Dict]:
+        """Calculate new positions, rewards, and done flags"""
+        new_positions = {}
+        rewards = {}
+        dones = {}
+        
+        # Calculate new positions
+        for agent_id, action in actions.items():
+            if agent_id in self.agent_positions:
+                pos = self.agent_positions[agent_id]
+                dx, dy = moves[action]
+                new_positions[agent_id] = self._calculate_new_position(pos, dx, dy)
+        
+        # Check for collisions and calculate rewards
+        for agent_id, new_pos in new_positions.items():
+            old_pos = self.agent_positions[agent_id]
+            goal = self.goals[agent_id]
+            
+            reward, done, final_pos = self._calculate_agent_reward(
+                agent_id, old_pos, new_pos, goal, new_positions
+            )
+            
+            rewards[agent_id] = reward
+            dones[agent_id] = done
+            new_positions[agent_id] = final_pos
+        
+        return new_positions, rewards, dones
+    
+    def _calculate_agent_reward(self, agent_id: int, old_pos: Tuple[int, int], 
+                               new_pos: Tuple[int, int], goal: Tuple[int, int],
+                               all_new_positions: Dict[int, Tuple[int, int]]) -> Tuple[float, bool, Tuple[int, int]]:
+        """Calculate reward for a single agent"""
+        # Check for obstacles
+        if new_pos in self.obstacles:
+            return -10, False, old_pos  # Collision penalty, stay in place
+        
+        # Check for agent collisions
+        for other_id, other_new_pos in all_new_positions.items():
+            if other_id != agent_id and other_new_pos == new_pos:
+                return -5, False, old_pos  # Agent collision penalty, stay in place
+        
+        # Calculate progress reward
+        old_dist = np.linalg.norm(np.array(old_pos) - np.array(goal))
+        new_dist = np.linalg.norm(np.array(new_pos) - np.array(goal))
+        
+        if new_pos == goal:
+            # Goal reached - shift goal
+            self.goals[agent_id] = (rng.integers(0, self.grid_size), 
+                                   rng.integers(0, self.grid_size))
+            return 100, True, new_pos
+        
+        return (old_dist - new_dist) * 10, False, new_pos  # Progress reward
 
 class SensorSimulator:
     """Simulates sensor data loss"""
@@ -339,7 +381,7 @@ class SensorSimulator:
     
     def get_sensor_status(self) -> Dict[str, bool]:
         """Get current sensor status"""
-        return {sensor: random.random() > self.loss_probability 
+        return {sensor: rng.random() > self.loss_probability 
                 for sensor in self.sensor_types}
     
     def apply_sensor_loss(self, state: np.ndarray, sensor_status: Dict[str, bool]) -> np.ndarray:
@@ -360,7 +402,7 @@ class MADQNAgent:
     """Multi-Agent DQN Agent"""
     
     def __init__(self, agent_id: int, state_size: int, action_size: int, 
-                 lr: float = 0.001, device: str = 'cpu'):
+                 lr: float = 0.001, weight_decay: float = 1e-4, device: str = 'cpu'):
         self.agent_id = agent_id
         self.state_size = state_size
         self.action_size = action_size
@@ -369,7 +411,8 @@ class MADQNAgent:
         # Networks
         self.q_network = DQNNetwork(state_size, action_size).to(self.device)
         self.target_network = DQNNetwork(state_size, action_size).to(self.device)
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        # Fixed: Added weight_decay hyperparameter
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr, weight_decay=weight_decay)
         
         # Hyperparameters
         self.gamma = 0.95
@@ -391,8 +434,8 @@ class MADQNAgent:
     
     def select_action(self, state: np.ndarray, training: bool = True) -> int:
         """Select action using epsilon-greedy policy"""
-        if training and random.random() < self.epsilon:
-            return random.randint(0, self.action_size - 1)
+        if training and rng.random() < self.epsilon:
+            return rng.integers(0, self.action_size)
         
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         q_values = self.q_network(state_tensor)
@@ -519,7 +562,8 @@ class ROS2Interface:
         # In real implementation, this would publish to ROS2 topics
         logger.debug(f"Publishing action {action} for agent {agent_id}")
     
-    def subscribe_sensor_data(self, callback):
+    # Fixed: Removed unused 'callback' parameter
+    def subscribe_sensor_data(self):
         """Subscribe to sensor data (ROS2 compatible)"""
         # In real implementation, this would subscribe to ROS2 topics
         logger.debug("Subscribed to sensor data")
@@ -594,7 +638,7 @@ class MADQNSystem:
     def run_episode(self, training: bool = True) -> Dict[str, float]:
         """Run a single episode"""
         states = self.environment.reset()
-        episode_rewards = {i: 0 for i in range(self.num_agents)}
+        rewards_per_agent = {i: 0 for i in range(self.num_agents)}
         episode_steps = 0
         
         while episode_steps < self.max_episode_steps:
@@ -603,77 +647,25 @@ class MADQNSystem:
             # Get sensor status
             sensor_status = self.sensor_simulator.get_sensor_status()
             
-            # Select actions for all agents
-            actions = {}
-            for agent_id in range(self.num_agents):
-                state = states[agent_id]
-                
-                # Apply sensor loss
-                corrupted_state = self.sensor_simulator.apply_sensor_loss(state, sensor_status)
-                
-                # Select action
-                action = self.agents[agent_id].select_action(corrupted_state, training)
-                
-                # Validate action
-                if not self.security_manager.validate_action(action, self.action_size):
-                    action = 0  # Default to "stay" action
-                
-                actions[agent_id] = action
-                
-                # Log state-action pair
-                sap = StateActionPair(
-                    timestamp=time.time(),
-                    agent_id=agent_id,
-                    state=state,
-                    action=action,
-                    reward=0,  # Will be updated after step
-                    next_state=None,  # Will be updated after step
-                    done=False,  # Will be updated after step
-                    sensor_status=sensor_status,
-                    state_hash=self.security_manager.hash_state(state)
-                )
-                self.data_logger.log_state_action_pair(sap)
-            
-            # Execute actions
+            # Select and execute actions
+            actions = self._select_actions(states, sensor_status, training)
             next_states, rewards, dones, _ = self.environment.step(actions)
             
-            # Store experiences and train
+            # Handle training and logging
             if training:
-                training_futures = []
-                for agent_id in range(self.num_agents):
-                    state = states[agent_id]
-                    action = actions[agent_id]
-                    reward = rewards.get(agent_id, 0)
-                    next_state = next_states[agent_id]
-                    done = dones.get(agent_id, False)
-                    
-                    # Store experience
-                    self.agents[agent_id].store_experience(state, action, reward, next_state, done)
-                    
-                    # Submit training task
-                    future = self.training_executor.submit(self.agents[agent_id].train)
-                    training_futures.append((agent_id, future))
-                    
-                    episode_rewards[agent_id] += reward
-                
-                # Collect training results
-                for agent_id, future in training_futures:
-                    try:
-                        loss = future.result(timeout=0.05)  # 50ms timeout
-                        if loss > 0:
-                            self.performance_monitor.record_training_loss(agent_id, loss)
-                    except Exception as e:
-                        logger.warning(f"Training timeout for agent {agent_id}: {e}")
+                self._handle_training_step(states, actions, rewards, next_states, dones)
             
-            # Update states
+            # Update tracking
+            for agent_id, reward in rewards.items():
+                rewards_per_agent[agent_id] += reward
+            
             states = next_states
             episode_steps += 1
             
-            # Record decision time
+            # Record performance
             decision_time = time.time() - start_time
             self.performance_monitor.record_decision_time(decision_time)
             
-            # Check if decision time exceeds 60ms
             if decision_time > 0.060:
                 logger.warning(f"Decision time exceeded 60ms: {decision_time*1000:.2f}ms")
             
@@ -686,20 +678,84 @@ class MADQNSystem:
                 break
         
         self.episode_count += 1
-        return episode_rewards
+        return rewards_per_agent
+    
+    def _select_actions(self, states: Dict[int, np.ndarray], 
+                       sensor_status: Dict[str, bool], training: bool) -> Dict[int, int]:
+        """Select actions for all agents"""
+        actions = {}
+        
+        for agent_id in range(self.num_agents):
+            state = states[agent_id]
+            
+            # Apply sensor loss
+            corrupted_state = self.sensor_simulator.apply_sensor_loss(state, sensor_status)
+            
+            # Select action
+            action = self.agents[agent_id].select_action(corrupted_state, training)
+            
+            # Validate action
+            if not self.security_manager.validate_action(action, self.action_size):
+                action = 0  # Default to "stay" action
+            
+            actions[agent_id] = action
+            
+            # Log state-action pair
+            sap = StateActionPair(
+                timestamp=time.time(),
+                agent_id=agent_id,
+                state=state,
+                action=action,
+                reward=0,  # Will be updated after step
+                next_state=None,  # Will be updated after step
+                done=False,  # Will be updated after step
+                sensor_status=sensor_status,
+                state_hash=self.security_manager.hash_state(state)
+            )
+            self.data_logger.log_state_action_pair(sap)
+        
+        return actions
+    
+    def _handle_training_step(self, states: Dict[int, np.ndarray], actions: Dict[int, int],
+                             rewards: Dict[int, float], next_states: Dict[int, np.ndarray],
+                             dones: Dict[int, bool]):
+        """Handle training for all agents"""
+        training_futures = []
+        
+        for agent_id in range(self.num_agents):
+            state = states[agent_id]
+            action = actions[agent_id]
+            reward = rewards.get(agent_id, 0)
+            next_state = next_states[agent_id]
+            done = dones.get(agent_id, False)
+            
+            # Store experience
+            self.agents[agent_id].store_experience(state, action, reward, next_state, done)
+            
+            # Submit training task
+            future = self.training_executor.submit(self.agents[agent_id].train)
+            training_futures.append((agent_id, future))
+        
+        # Collect training results
+        for agent_id, future in training_futures:
+            try:
+                loss = future.result(timeout=0.05)  # 50ms timeout
+                if loss > 0:
+                    self.performance_monitor.record_training_loss(agent_id, loss)
+            except Exception as e:
+                logger.warning(f"Training timeout for agent {agent_id}: {e}")
     
     def train(self, num_episodes: int = 1000):
         """Train the system"""
         logger.info(f"Starting training for {num_episodes} episodes")
         
         for episode in range(num_episodes):
-            episode_rewards = self.run_episode(training=True)
+            # Fixed: Removed unused variable 'episode_rewards'
+            self.run_episode(training=True)
             
             if episode % 100 == 0:
-                avg_reward = np.mean(list(episode_rewards.values()))
                 performance_report = self.performance_monitor.get_performance_report()
-                
-                logger.info(f"Episode {episode}: Avg Reward: {avg_reward:.2f}, "
+                logger.info(f"Episode {episode}: "
                           f"Avg Decision Time: {performance_report['avg_decision_time_ms']:.2f}ms")
         
         logger.info("Training completed")
@@ -712,7 +768,7 @@ class MADQNSystem:
         episode_count = 0
         
         while time.time() - start_time < duration_seconds:
-            episode_rewards = self.run_episode(training=True)
+            self.run_episode(training=True)
             episode_count += 1
             
             # Periodic performance reporting

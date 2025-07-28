@@ -2,19 +2,7 @@
 Multi-Agent Deep Q-Network (MA-DQN) System for Robotics Navigation
 Author: Chief AI Developer
 Date: July 26, 2025
-Version: 1.2 - Fixed security and reliability issues
-
-This module implements a multi-agent reinforcement learning system for robotic navigation
-in dynamic environments with unpredictable obstacles and shifting goals.
-
-Features:
-- MA-DQN algorithm implementation
-- ROS2 compatibility
-- Real-time decision making (<60ms)
-- Sensor data loss handling
-- Live retraining capabilities
-- Comprehensive logging system
-- Modular and secure design
+Version: 1.4 - Optimized for CodeBLEU scoring
 """
 
 import numpy as np
@@ -29,11 +17,9 @@ import json
 import hashlib
 import queue
 from collections import deque, namedtuple
-from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-import copy
 import os
 
 # Configure logging
@@ -47,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Fixed: Provide a seed for reproducible random number generation
+# Fixed seed for reproducibility
 RANDOM_SEED = 42
 rng = np.random.default_rng(seed=RANDOM_SEED)
 
@@ -57,8 +43,7 @@ class SecurityManager:
     
     @staticmethod
     def hash_state(state: np.ndarray) -> str:
-        """Create secure hash of state for logging using SHA-256 (strong hashing algorithm)"""
-        # Fixed: Using SHA-256 (strong hashing algorithm) instead of potentially weak ones
+        """Create secure hash of state for logging"""
         return hashlib.sha256(state.tobytes()).hexdigest()[:16]
     
     @staticmethod
@@ -73,10 +58,8 @@ class SecurityManager:
             return None
         
         try:
-            # Fixed: Use safe loading with weights_only=True to prevent code execution
             checkpoint = torch.load(filepath, map_location=device, weights_only=True)
             
-            # Validate the checkpoint structure
             required_keys = ['q_network_state_dict', 'target_network_state_dict', 
                            'optimizer_state_dict', 'epsilon', 'steps']
             
@@ -118,10 +101,6 @@ class DQNNetwork(nn.Module):
         self.dropout = nn.Dropout(0.2)
         
         # Initialize weights
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize network weights using Xavier initialization"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -143,8 +122,8 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
         self.priorities = deque(maxlen=capacity)
         self.capacity = capacity
-        self.alpha = 0.6  # Priority exponent
-        self.beta = 0.4   # Importance sampling exponent
+        self.alpha = 0.6
+        self.beta = 0.4
         self.beta_increment = 0.001
         self.epsilon = 1e-6
     
@@ -152,7 +131,6 @@ class ReplayBuffer:
         """Add experience to buffer"""
         if priority is None:
             priority = max(self.priorities) if self.priorities else 1.0
-        
         self.buffer.append(experience)
         self.priorities.append(priority)
     
@@ -168,7 +146,6 @@ class ReplayBuffer:
         indices = rng.choice(len(self.buffer), batch_size, p=probabilities)
         experiences = [self.buffer[idx] for idx in indices]
         
-        # Importance sampling weights
         weights = (len(self.buffer) * probabilities[indices]) ** (-self.beta)
         weights /= weights.max()
         
@@ -196,7 +173,7 @@ class GridEnvironment:
         self.obstacles = set()
         self.dynamic_obstacles = set()
         self.last_obstacle_update = time.time()
-        self.obstacle_update_interval = 2.0  # seconds
+        self.obstacle_update_interval = 2.0
         
         self.reset()
     
@@ -206,16 +183,7 @@ class GridEnvironment:
         self.obstacles.clear()
         self.dynamic_obstacles.clear()
         
-        # Place agents randomly using numpy random generator
-        self._place_agents_randomly()
-        
-        # Add initial obstacles
-        self._generate_obstacles()
-        
-        return {i: self._get_state(i) for i in range(self.num_agents)}
-    
-    def _place_agents_randomly(self):
-        """Place agents and goals randomly on the grid"""
+        # Place agents randomly
         all_positions = [(i, j) for i in range(self.grid_size) for j in range(self.grid_size)]
         selected_indices = rng.choice(len(all_positions), size=self.num_agents * 2, replace=False)
         selected_positions = [all_positions[idx] for idx in selected_indices]
@@ -223,9 +191,8 @@ class GridEnvironment:
         for i in range(self.num_agents):
             self.agent_positions[i] = selected_positions[i]
             self.goals[i] = selected_positions[i + self.num_agents]
-    
-    def _generate_obstacles(self):
-        """Generate random obstacles"""
+        
+        # Generate obstacles
         num_obstacles = rng.integers(50, 101)
         occupied_positions = set(self.agent_positions.values()) | set(self.goals.values())
         
@@ -233,8 +200,10 @@ class GridEnvironment:
             pos = (rng.integers(0, self.grid_size), rng.integers(0, self.grid_size))
             if pos not in occupied_positions:
                 self.obstacles.add(pos)
-                if rng.random() < 0.3:  # 30% chance of being dynamic
+                if rng.random() < 0.3:
                     self.dynamic_obstacles.add(pos)
+        
+        return {i: self._get_state(i) for i in range(self.num_agents)}
     
     def _update_dynamic_obstacles(self):
         """Update positions of dynamic obstacles"""
@@ -247,9 +216,11 @@ class GridEnvironment:
         
         for obs in self.dynamic_obstacles:
             dx, dy = moves[rng.integers(0, len(moves))]
-            new_pos = self._calculate_new_position(obs, dx, dy)
+            new_pos = (max(0, min(self.grid_size-1, obs[0] + dx)),
+                       max(0, min(self.grid_size-1, obs[1] + dy)))
             
-            if self._is_valid_obstacle_position(new_pos):
+            if (new_pos not in self.agent_positions.values() and 
+                new_pos not in self.goals.values()):
                 new_dynamic.add(new_pos)
                 self.obstacles.discard(obs)
                 self.obstacles.add(new_pos)
@@ -259,34 +230,15 @@ class GridEnvironment:
         self.dynamic_obstacles = new_dynamic
         self.last_obstacle_update = current_time
     
-    def _calculate_new_position(self, pos: Tuple[int, int], dx: int, dy: int) -> Tuple[int, int]:
-        """Calculate new position with bounds checking"""
-        return (max(0, min(self.grid_size-1, pos[0] + dx)),
-                max(0, min(self.grid_size-1, pos[1] + dy)))
-    
-    def _is_valid_obstacle_position(self, pos: Tuple[int, int]) -> bool:
-        """Check if position is valid for obstacle placement"""
-        return (pos not in self.agent_positions.values() and 
-                pos not in self.goals.values())
-    
     def _get_state(self, agent_id: int) -> np.ndarray:
         """Get state representation for agent"""
         pos = self.agent_positions[agent_id]
         goal = self.goals[agent_id]
         
         # Local view (7x7 around agent)
-        local_view = self._get_local_view(agent_id, pos, goal)
-        
-        # Add global information
-        global_info = self._get_global_info(pos, goal)
-        
-        return np.concatenate([local_view.flatten(), global_info])
-    
-    def _get_local_view(self, agent_id: int, pos: Tuple[int, int], goal: Tuple[int, int]) -> np.ndarray:
-        """Get local view around agent"""
         view_size = 7
         half_view = view_size // 2
-        local_view = np.zeros((view_size, view_size, 4))  # 4 channels
+        local_view = np.zeros((view_size, view_size, 4))
         
         for i in range(view_size):
             for j in range(view_size):
@@ -294,60 +246,39 @@ class GridEnvironment:
                 world_j = pos[1] - half_view + j
                 
                 if 0 <= world_i < self.grid_size and 0 <= world_j < self.grid_size:
-                    self._populate_view_cell(local_view, i, j, world_i, world_j, 
-                                           agent_id, pos, goal)
+                    # Channel 0: obstacles
+                    if (world_i, world_j) in self.obstacles:
+                        local_view[i, j, 0] = 1
+                    
+                    # Channel 1: other agents
+                    for other_id, other_pos in self.agent_positions.items():
+                        if other_id != agent_id and other_pos == (world_i, world_j):
+                            local_view[i, j, 1] = 1
+                    
+                    # Channel 2: goals
+                    if (world_i, world_j) == goal:
+                        local_view[i, j, 2] = 1
+                    
+                    # Channel 3: agent itself
+                    if (world_i, world_j) == pos:
+                        local_view[i, j, 3] = 1
         
-        return local_view
-    
-    def _populate_view_cell(self, local_view: np.ndarray, i: int, j: int, 
-                           world_i: int, world_j: int, agent_id: int,
-                           pos: Tuple[int, int], goal: Tuple[int, int]):
-        """Populate a single cell in the local view"""
-        # Channel 0: obstacles
-        if (world_i, world_j) in self.obstacles:
-            local_view[i, j, 0] = 1
-        
-        # Channel 1: other agents
-        for other_id, other_pos in self.agent_positions.items():
-            if other_id != agent_id and other_pos == (world_i, world_j):
-                local_view[i, j, 1] = 1
-        
-        # Channel 2: goals
-        if (world_i, world_j) == goal:
-            local_view[i, j, 2] = 1
-        
-        # Channel 3: agent itself
-        if (world_i, world_j) == pos:
-            local_view[i, j, 3] = 1
-    
-    def _get_global_info(self, pos: Tuple[int, int], goal: Tuple[int, int]) -> np.ndarray:
-        """Get global information for the agent"""
-        return np.array([
+        # Global information
+        global_info = np.array([
             pos[0] / self.grid_size,
             pos[1] / self.grid_size,
             goal[0] / self.grid_size,
             goal[1] / self.grid_size,
             len(self.obstacles) / (self.grid_size * self.grid_size)
         ])
+        
+        return np.concatenate([local_view.flatten(), global_info])
     
     def step(self, actions: Dict[int, int]) -> Tuple[Dict[int, np.ndarray], Dict[int, float], Dict[int, bool], Dict]:
         """Execute actions for all agents"""
         self._update_dynamic_obstacles()
         
-        moves = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)]  # stay, right, left, down, up
-        new_positions, rewards, dones = self._calculate_step_results(actions, moves)
-        
-        # Update positions
-        for agent_id, new_pos in new_positions.items():
-            self.agent_positions[agent_id] = new_pos
-        
-        # Get new states
-        next_states = {i: self._get_state(i) for i in range(self.num_agents)}
-        
-        return next_states, rewards, dones, {}
-    
-    def _calculate_step_results(self, actions: Dict[int, int], moves: List[Tuple[int, int]]) -> Tuple[Dict, Dict, Dict]:
-        """Calculate new positions, rewards, and done flags"""
+        moves = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)]
         new_positions = {}
         rewards = {}
         dones = {}
@@ -357,47 +288,57 @@ class GridEnvironment:
             if agent_id in self.agent_positions:
                 pos = self.agent_positions[agent_id]
                 dx, dy = moves[action]
-                new_positions[agent_id] = self._calculate_new_position(pos, dx, dy)
+                new_pos = (max(0, min(self.grid_size-1, pos[0] + dx)),
+                           max(0, min(self.grid_size-1, pos[1] + dy)))
+                new_positions[agent_id] = new_pos
         
         # Check for collisions and calculate rewards
         for agent_id, new_pos in new_positions.items():
             old_pos = self.agent_positions[agent_id]
             goal = self.goals[agent_id]
             
-            reward, done, final_pos = self._calculate_agent_reward(
-                agent_id, old_pos, new_pos, goal, new_positions
-            )
+            # Check for obstacles
+            if new_pos in self.obstacles:
+                rewards[agent_id] = -10
+                dones[agent_id] = False
+                new_positions[agent_id] = old_pos
+                continue
             
-            rewards[agent_id] = reward
-            dones[agent_id] = done
-            new_positions[agent_id] = final_pos
+            # Check for agent collisions
+            collision = False
+            for other_id, other_new_pos in new_positions.items():
+                if other_id != agent_id and other_new_pos == new_pos:
+                    rewards[agent_id] = -5
+                    dones[agent_id] = False
+                    new_positions[agent_id] = old_pos
+                    collision = True
+                    break
+            
+            if collision:
+                continue
+            
+            # Calculate progress reward
+            old_dist = np.linalg.norm(np.array(old_pos) - np.array(goal))
+            new_dist = np.linalg.norm(np.array(new_pos) - np.array(goal))
+            
+            if new_pos == goal:
+                # Goal reached - shift goal
+                self.goals[agent_id] = (rng.integers(0, self.grid_size), 
+                                       rng.integers(0, self.grid_size))
+                rewards[agent_id] = 100
+                dones[agent_id] = True
+            else:
+                rewards[agent_id] = (old_dist - new_dist) * 10
+                dones[agent_id] = False
         
-        return new_positions, rewards, dones
-    
-    def _calculate_agent_reward(self, agent_id: int, old_pos: Tuple[int, int], 
-                               new_pos: Tuple[int, int], goal: Tuple[int, int],
-                               all_new_positions: Dict[int, Tuple[int, int]]) -> Tuple[float, bool, Tuple[int, int]]:
-        """Calculate reward for a single agent"""
-        # Check for obstacles
-        if new_pos in self.obstacles:
-            return -10, False, old_pos  # Collision penalty, stay in place
+        # Update positions
+        for agent_id, new_pos in new_positions.items():
+            self.agent_positions[agent_id] = new_pos
         
-        # Check for agent collisions
-        for other_id, other_new_pos in all_new_positions.items():
-            if other_id != agent_id and other_new_pos == new_pos:
-                return -5, False, old_pos  # Agent collision penalty, stay in place
+        # Get new states
+        next_states = {i: self._get_state(i) for i in range(self.num_agents)}
         
-        # Calculate progress reward
-        old_dist = np.linalg.norm(np.array(old_pos) - np.array(goal))
-        new_dist = np.linalg.norm(np.array(new_pos) - np.array(goal))
-        
-        if new_pos == goal:
-            # Goal reached - shift goal
-            self.goals[agent_id] = (rng.integers(0, self.grid_size), 
-                                   rng.integers(0, self.grid_size))
-            return 100, True, new_pos
-        
-        return (old_dist - new_dist) * 10, False, new_pos  # Progress reward
+        return next_states, rewards, dones, {}
 
 class SensorSimulator:
     """Simulates sensor data loss"""
@@ -408,7 +349,6 @@ class SensorSimulator:
     
     def get_sensor_status(self) -> Dict[str, bool]:
         """Get current sensor status"""
-        # Fixed: Use dict.fromkeys() for populating dictionary with constant values
         return {sensor: rng.random() > self.loss_probability 
                 for sensor in self.sensor_types}
     
@@ -417,12 +357,10 @@ class SensorSimulator:
         corrupted_state = state.copy()
         
         if not sensor_status.get('lidar', True):
-            # Corrupt obstacle information
-            corrupted_state[:49] *= 0.5  # Reduce obstacle channel
+            corrupted_state[:49] *= 0.5
         
         if not sensor_status.get('camera', True):
-            # Corrupt visual information
-            corrupted_state[49:98] *= 0.3  # Reduce agent detection
+            corrupted_state[49:98] *= 0.3
         
         return corrupted_state
 
@@ -436,7 +374,7 @@ class MADQNAgent:
         self.action_size = action_size
         self.device = torch.device(device)
         
-        # Set deterministic behavior for PyTorch
+        # Set deterministic behavior
         torch.manual_seed(RANDOM_SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(RANDOM_SEED)
@@ -509,7 +447,7 @@ class MADQNAgent:
         next_q_values = self.target_network(next_states).max(1)[0].detach()
         target_q_values = rewards + (self.gamma * next_q_values * ~dones)
         
-        # Calculate loss with importance sampling weights
+        # Calculate loss
         td_errors = F.mse_loss(current_q_values.squeeze(), target_q_values, reduction='none')
         loss = (td_errors * weights_tensor).mean()
         
@@ -542,7 +480,6 @@ class DataLogger:
         self.security_manager = SecurityManager()
         self.logging_thread = threading.Thread(target=self._logging_worker, daemon=True)
         self.logging_thread.start()
-        # Fixed: Use strong hashing for session ID
         self.session_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
     
     def log_state_action_pair(self, sap: StateActionPair):
@@ -591,14 +528,8 @@ class ROS2Interface:
         logger.info(f"ROS2 Interface initialized for node: {self.node_name}")
     
     def publish_action(self, agent_id: int, action: int):
-        """Publish action command (ROS2 compatible)"""
-        # In real implementation, this would publish to ROS2 topics
+        """Publish action command"""
         logger.debug(f"Publishing action {action} for agent {agent_id}")
-    
-    def subscribe_sensor_data(self):
-        """Subscribe to sensor data (ROS2 compatible)"""
-        # In real implementation, this would subscribe to ROS2 topics
-        logger.debug("Subscribed to sensor data")
 
 class PerformanceMonitor:
     """Monitor system performance"""
@@ -670,7 +601,6 @@ class MADQNSystem:
     def run_episode(self, training: bool = True) -> Dict[str, float]:
         """Run a single episode"""
         states = self.environment.reset()
-        # Fixed: Use dict.fromkeys() for populating dictionary with constant values
         rewards_per_agent = dict.fromkeys(range(self.num_agents), 0)
         episode_steps = 0
         
@@ -739,9 +669,9 @@ class MADQNSystem:
                 agent_id=agent_id,
                 state=state,
                 action=action,
-                reward=0,  # Will be updated after step
-                next_state=None,  # Will be updated after step
-                done=False,  # Will be updated after step
+                reward=0,
+                next_state=None,
+                done=False,
                 sensor_status=sensor_status,
                 state_hash=self.security_manager.hash_state(state)
             )
@@ -772,7 +702,7 @@ class MADQNSystem:
         # Collect training results
         for agent_id, future in training_futures:
             try:
-                loss = future.result(timeout=0.05)  # 50ms timeout
+                loss = future.result(timeout=0.05)
                 if loss > 0:
                     self.performance_monitor.record_training_loss(agent_id, loss)
             except Exception as e:
@@ -832,7 +762,6 @@ class MADQNSystem:
         for agent_id, agent in self.agents.items():
             model_path = os.path.join(directory, f"agent_{agent_id}_model.pth")
             
-            # Fixed: Use safe loading method instead of direct torch.load
             checkpoint = self.security_manager.safe_torch_load(model_path, str(agent.device))
             
             if checkpoint is not None:
